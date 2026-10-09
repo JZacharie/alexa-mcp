@@ -151,6 +151,8 @@ fn config_dir() -> PathBuf {
 fn load_alexa_cookies() -> Vec<RawCookie> {
     let (source, origin) = if let Some(json) = non_empty_env("ALEXA_COOKIES_JSON") {
         (json, "ALEXA_COOKIES_JSON")
+    } else if let Some(json) = non_empty_env("AMAZON_COOKIES_JSON") {
+        (json, "AMAZON_COOKIES_JSON")
     } else if let Some(path) = non_empty_env("ALEXA_COOKIES_FILE") {
         match std::fs::read_to_string(&path) {
             Ok(contents) => (contents, "ALEXA_COOKIES_FILE"),
