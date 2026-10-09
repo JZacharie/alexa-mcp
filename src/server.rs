@@ -66,7 +66,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(health_check))
-        .route("/sse", get(sse_handler))
+        .route("/sse", get(sse_handler).post(mcp_message_handler))
         .route("/message", post(mcp_message_handler))
         .route("/api/alexa/items", get(alexa_items_handler))
         .route("/api/alexa/items/add", post(alexa_add_handler))
