@@ -110,6 +110,15 @@ impl McpHandler {
                 result: Some(json!({})),
                 error: None,
             },
+            method if method.starts_with("notifications/") => {
+                info!("Ignoring MCP notification: {method}");
+                JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id,
+                    result: Some(json!({})),
+                    error: None,
+                }
+            }
             "tools/list" => JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id,

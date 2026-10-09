@@ -64,6 +64,7 @@ pub struct DeleteItemRequest {
 /// Builds the HTTP router: MCP transport plus a small REST surface.
 pub fn create_router(state: AppState) -> Router {
     Router::new()
+        .route("/", post(mcp_message_handler))
         .route("/health", get(health_check))
         .route("/ready", get(health_check))
         .route("/sse", get(sse_handler).post(mcp_message_handler))
