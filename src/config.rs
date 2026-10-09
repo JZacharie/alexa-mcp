@@ -58,6 +58,8 @@ pub struct AppConfig {
     pub chrome_headless: bool,
     /// Where exported cookies are persisted by the cookie tool.
     pub cookies_output_path: PathBuf,
+    /// Whether to inject stored cookies before navigating in the browser.
+    pub inject_cookies: bool,
     /// Minimum delay between two Amazon requests, in milliseconds.
     pub min_interval_ms: u64,
     /// Extra random jitter added between requests, in milliseconds.
@@ -76,6 +78,7 @@ impl AppConfig {
             non_empty_env("AMAZON_URL").unwrap_or_else(|| DEFAULT_AMAZON_URL.to_string());
         let alexa_list_id = non_empty_env("ALEXA_LIST_ID");
         let alexa_cookies = load_alexa_cookies();
+        let inject_cookies = bool_env("ALEXA_INJECT_COOKIES", true);
         let browser_mode = BrowserMode::from_env();
         let browserless_ws_url = non_empty_env("BROWSERLESS_WS_URL")
             .unwrap_or_else(|| DEFAULT_BROWSERLESS_WS_URL.to_string());
@@ -95,6 +98,7 @@ impl AppConfig {
             amazon_url,
             alexa_list_id,
             alexa_cookies,
+            inject_cookies,
             browser_mode,
             browserless_ws_url,
             browserless_token,
@@ -132,13 +136,23 @@ impl AppConfig {
     }
 }
 
-/// Base directory for persisted state (~/.alexa-mcp by default).
+/// Base directory for persisted state (~/.alexa-mcp by default, fallback to /tmp/.alexa-mcp).
 fn config_dir() -> PathBuf {
     if let Some(dir) = non_empty_env("ALEXA_CONFIG_DIR") {
-        return PathBuf::from(dir);
+        let path = PathBuf::from(dir);
+        if std::fs::create_dir_all(&path).is_ok() {
+            return path;
+        }
     }
     if let Some(home) = non_empty_env("HOME").or_else(|| non_empty_env("USERPROFILE")) {
-        return PathBuf::from(home).join(".alexa-mcp");
+        let path = PathBuf::from(home).join(".alexa-mcp");
+        if std::fs::create_dir_all(&path).is_ok() {
+            return path;
+        }
+    }
+    let fallback = PathBuf::from("/tmp/.alexa-mcp");
+    if std::fs::create_dir_all(&fallback).is_ok() {
+        return fallback;
     }
     PathBuf::from(".alexa-mcp")
 }

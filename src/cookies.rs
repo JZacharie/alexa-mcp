@@ -5,7 +5,9 @@
 //! when exporting the live session read from the browser via CDP, so an export
 //! can be fed straight back into ALEXA_COOKIES_JSON or the embedded file.
 
-use chromiumoxide::cdp::browser_protocol::network::Cookie;
+use chromiumoxide::cdp::browser_protocol::network::{
+    Cookie, CookieParam, CookieSameSite, TimeSinceEpoch,
+};
 use serde::{Deserialize, Serialize};
 
 /// A single cookie in the browser-extension export format.
@@ -61,6 +63,57 @@ impl RawCookie {
             host_only: Some(!cookie.domain.starts_with('.')),
             session: Some(cookie.session),
             store_id: None,
+        }
+    }
+
+    /// Converts an exported cookie into a CDP CookieParam.
+    pub fn to_cookie_param(&self, default_url: &str) -> Result<CookieParam, String> {
+        let mut builder = CookieParam::builder().name(&self.name).value(&self.value);
+
+        match self
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            Some(domain) => builder = builder.domain(domain),
+            None => builder = builder.url(default_url),
+        }
+
+        let path = self
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/");
+        builder = builder.path(path);
+
+        if let Some(secure) = self.secure {
+            builder = builder.secure(secure);
+        }
+        if let Some(http_only) = self.http_only {
+            builder = builder.http_only(http_only);
+        }
+        if let Some(same_site) = self.normalized_same_site() {
+            builder = builder.same_site(same_site);
+        }
+
+        if self.session != Some(true) {
+            if let Some(expiration_date) = self.expiration_date.filter(|e| *e > 0.0) {
+                builder = builder.expires(TimeSinceEpoch::new(expiration_date));
+            }
+        }
+
+        builder.build()
+    }
+
+    fn normalized_same_site(&self) -> Option<CookieSameSite> {
+        let raw = self.same_site.as_deref()?.trim().to_ascii_lowercase();
+        match raw.as_str() {
+            "strict" => Some(CookieSameSite::Strict),
+            "lax" => Some(CookieSameSite::Lax),
+            "none" | "no_restriction" => Some(CookieSameSite::None),
+            _ => None,
         }
     }
 }

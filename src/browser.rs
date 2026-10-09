@@ -2,9 +2,11 @@ use crate::config::{AppConfig, BrowserMode};
 use crate::cookies::{is_amazon_domain, RawCookie};
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::Handler;
 use chromiumoxide::Page;
 use futures::StreamExt;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,11 +16,46 @@ use tracing::{debug, error, info, warn};
 /// How long to wait after a top-level navigation before reading the session.
 const CHALLENGE_SETTLE: Duration = Duration::from_millis(2000);
 
-/// Browser helper used only to obtain the Amazon cookies.
+/// How many times a browser connect + navigation is attempted before failing.
+const CONNECT_ATTEMPTS: usize = 3;
+
+/// Delay between two browser session attempts.
+const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
+
+/// A browser page owned for the duration of one tool call.
 ///
-/// The shopping list itself is read over plain HTTPS with a cookie replay
-/// (see crate::alexa), so the browser is required only when exporting a fresh
-/// Amazon session.
+/// The page is closed when the session is dropped, including on an early error
+/// return, so a long-lived browser cannot accumulate tabs.
+pub struct Session {
+    page: Page,
+}
+
+impl Session {
+    fn new(page: Page) -> Self {
+        Self { page }
+    }
+}
+
+impl Deref for Session {
+    type Target = Page;
+
+    fn deref(&self) -> &Page {
+        &self.page
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let page = self.page.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = page.close().await;
+            });
+        }
+    }
+}
+
+/// Browser helper used only to obtain the Amazon cookies.
 #[derive(Clone)]
 pub struct BrowserClient {
     mode: BrowserMode,
@@ -43,30 +80,114 @@ impl BrowserClient {
         }
     }
 
-    /// Returns a page navigated to origin, creating the browser connection on
-    /// first use and reconnecting once if it became unusable.
-    pub async fn ensure_page(&self, origin: &str) -> Result<Page> {
-        match self.create_cached_page().await {
-            Ok(page) => {
-                self.open_origin(&page, origin).await?;
-                Ok(page)
-            }
-            Err(error) => {
-                warn!("Browser connection unusable ({error:?}); reconnecting");
-                self.reset().await;
-                let page = self.create_cached_page().await?;
-                self.open_origin(&page, origin).await?;
-                Ok(page)
-            }
-        }
+    /// Returns a session page navigated to origin, without pre-injected cookies.
+    pub async fn ensure_page(&self, origin: &str) -> Result<Session> {
+        self.ensure_page_with_cookies(origin, &[]).await
     }
 
-    /// Navigates the page to the Amazon origin so it holds the session cookies.
+    /// Returns a session page navigated to origin, injecting the given cookies
+    /// *before* navigation so the session is active immediately.
+    pub async fn ensure_page_with_cookies(
+        &self,
+        origin: &str,
+        cookies: &[RawCookie],
+    ) -> Result<Session> {
+        let mut last_error = None;
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            match self.create_session(origin, cookies).await {
+                Ok(session) => return Ok(session),
+                Err(error) => {
+                    warn!("Browser session attempt {attempt}/{CONNECT_ATTEMPTS} failed: {error:?}");
+                    self.reset().await;
+                    last_error = Some(error);
+                    if attempt < CONNECT_ATTEMPTS {
+                        tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("The browser session could not be established")))
+    }
+
+    async fn create_session(&self, origin: &str, cookies: &[RawCookie]) -> Result<Session> {
+        let page = self.create_cached_page().await?;
+        let session = Session::new(page);
+
+        if !cookies.is_empty() {
+            let injected = self
+                .inject_cookies(&session, cookies, origin)
+                .await
+                .context("Failed to inject the stored Amazon cookies")?;
+            info!("Injected {injected} stored Amazon cookie(s) before navigating to {origin}");
+        }
+
+        self.open_origin(&session, origin).await?;
+        Ok(session)
+    }
+
+    /// Injects cookies into the page's CDP session.
+    pub async fn inject_cookies(
+        &self,
+        page: &Page,
+        cookies: &[RawCookie],
+        default_url: &str,
+    ) -> Result<usize> {
+        let mut params = Vec::with_capacity(cookies.len());
+        for cookie in cookies {
+            match cookie.to_cookie_param(default_url) {
+                Ok(param) => params.push(param),
+                Err(error) => warn!("Skipping invalid cookie '{}': {error}", cookie.name),
+            }
+        }
+
+        if params.is_empty() {
+            warn!("No valid cookies to inject");
+            return Ok(0);
+        }
+
+        let count = params.len();
+        page.set_cookies(params)
+            .await
+            .context("Failed to set cookies through CDP Network.setCookies")?;
+        debug!("Injected {count} cookies into the CDP session");
+        Ok(count)
+    }
+
+    /// Navigates the page to the Amazon origin applying anti-bot stealth scripts.
     pub async fn open_origin(&self, page: &Page, origin: &str) -> Result<()> {
         debug!("Navigating to origin {origin}");
+        const STEALTH_SCRIPT: &str = r#"(() => {
+            try {
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                    configurable: true,
+                });
+            } catch (_) {}
+            try {
+                window.chrome = window.chrome || { runtime: {} };
+            } catch (_) {}
+        })()"#;
+
+        if let Ok(params) = EvaluateParams::builder()
+            .expression(STEALTH_SCRIPT)
+            .return_by_value(true)
+            .build()
+        {
+            let _ = page.evaluate_expression(params).await;
+        }
+
         page.goto(origin)
             .await
             .with_context(|| format!("Failed to navigate to {origin}"))?;
+
+        if let Ok(params) = EvaluateParams::builder()
+            .expression(STEALTH_SCRIPT)
+            .return_by_value(true)
+            .build()
+        {
+            let _ = page.evaluate_expression(params).await;
+        }
+
         tokio::time::sleep(CHALLENGE_SETTLE).await;
         Ok(())
     }

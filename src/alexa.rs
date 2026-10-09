@@ -104,6 +104,7 @@ pub struct AlexaClient {
     browser_client: BrowserClient,
     throttler: Arc<Throttler>,
     list_id: Mutex<Option<String>>,
+    cookies: Arc<Mutex<Vec<RawCookie>>>,
 }
 
 impl AlexaClient {
@@ -120,12 +121,14 @@ impl AlexaClient {
             config.max_retries,
             config.backoff_base_ms,
         ));
+        let cookies = Arc::new(Mutex::new(config.alexa_cookies.clone()));
         Self {
             config,
             http,
             browser_client,
             throttler,
             list_id: Mutex::new(None),
+            cookies,
         }
     }
 
@@ -218,27 +221,50 @@ impl AlexaClient {
     /// persisting them in the export format used by config/alexa-cookies.json.
     pub async fn export_cookies(&self, save: bool) -> Result<CookieExport> {
         let origin = self.config.amazon_origin();
-        let page = self.browser_client.ensure_page(&origin).await?;
-        let cookies = self.browser_client.get_cookies(&page).await?;
-        let _ = page.close().await;
+        let current_cookies = self.cookies.lock().await.clone();
+        let session = if self.config.inject_cookies && !current_cookies.is_empty() {
+            self.browser_client
+                .ensure_page_with_cookies(&origin, &current_cookies)
+                .await?
+        } else {
+            self.browser_client.ensure_page(&origin).await?
+        };
+
+        let cookies = self.browser_client.get_cookies(&session).await?;
+
+        // Update live in-memory cookies so subsequent requests immediately use them.
+        if !cookies.is_empty() {
+            let mut guard = self.cookies.lock().await;
+            *guard = cookies.clone();
+            info!(
+                "Updated in-memory Amazon session with {} cookie(s)",
+                cookies.len()
+            );
+        }
 
         let saved_to = if save {
             let json = serialize_cookies(&cookies)?;
-            if let Some(parent) = self.config.cookies_output_path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            std::fs::write(&self.config.cookies_output_path, json).with_context(|| {
-                format!(
-                    "Could not write cookies to {}",
-                    self.config.cookies_output_path.display()
-                )
-            })?;
+            let save_path = if let Some(parent) = self.config.cookies_output_path.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    // Fallback to /tmp if parent is not writable
+                    let tmp = std::path::PathBuf::from("/tmp/.alexa-mcp");
+                    let _ = std::fs::create_dir_all(&tmp);
+                    tmp.join("alexa-cookies.json")
+                } else {
+                    self.config.cookies_output_path.clone()
+                }
+            } else {
+                self.config.cookies_output_path.clone()
+            };
+
+            std::fs::write(&save_path, json)
+                .with_context(|| format!("Could not write cookies to {}", save_path.display()))?;
             info!(
                 "Saved {} Amazon cookies to {}",
                 cookies.len(),
-                self.config.cookies_output_path.display()
+                save_path.display()
             );
-            Some(self.config.cookies_output_path.display().to_string())
+            Some(save_path.display().to_string())
         } else {
             None
         };
@@ -284,8 +310,9 @@ impl AlexaClient {
                         .header("Accept-Language", "*")
                         .header("DNT", "1")
                         .header("Upgrade-Insecure-Requests", "1");
+                    let current_cookies = self.cookies.lock().await.clone();
                     if let Some(cookie) =
-                        cookie_header(&self.config.alexa_cookies, &self.config.amazon_host())
+                        cookie_header(&current_cookies, &self.config.amazon_host())
                     {
                         builder = builder.header("Cookie", cookie);
                     }
