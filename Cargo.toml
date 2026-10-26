@@ -10,10 +10,10 @@ readme = "README.md"
 
 [dependencies]
 # Async runtime and HTTP/MCP server
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = { version = "0.7", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization and observability
 serde = { version = "1.0", features = ["derive"] }
@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Amazon Alexa HTTP client
 reqwest = { version = "0.12", features = ["json"] }
-base64 = "0.22"
+base64 = "0.23"
 urlencoding = "2.1"
 
 # Headless browser used only to export the Amazon session cookies
